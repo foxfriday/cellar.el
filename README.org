@@ -1,0 +1,63 @@
+#+title: Cellar.el
+
+This is a small library used to manage a cellar using ~sqlite~.
+
+The database uses the following schema:
+
+#+begin_src sqlite
+CREATE TABLE IF NOT EXISTS producers(
+  pid INTEGER PRIMARY KEY AUTOINCREMENT,
+  producer TEXT NOT NULL,
+  varietal TEXT NOT NULL,
+  vineyard TEXT DEFAULT NULL,
+  designation TEXT DEFAULT NULL,
+  subregion TEXT DEFAULT NULL,
+  region TEXT NOT NULL,
+  country TEXT NOT NULL,
+  category TEXT DEFAULT NULL,
+  UNIQUE(producer, varietal, vineyard, designation, category));
+
+CREATE TABLE IF NOT EXISTS inventory(
+  iid INTEGER PRIMARY KEY AUTOINCREMENT,
+  pid INTEGER NOT NULL,
+  vint INTEGER,
+  btl INTEGER DEFAULT 750 NOT NULL,
+  oi INTEGER DEFAULT 0 NOT NULL,
+  hi INTEGER DEFAULT 0 NOT NULL,
+  ci INTEGER DEFAULT 0 NOT NULL,
+  alc INTEGER DEFAULT NULL,
+  w0 INTEGER DEFAULT NULL,
+  w1 INTEGER DEFAULT NULL,
+  UNIQUE(pid, vint, btl));
+
+CREATE VIEW IF NOT EXISTS wines as
+select inventory.iid,
+       inventory.vint,
+       inventory.btl,
+       inventory.oi + inventory.hi as tot,
+       inventory.w0,
+       inventory.w1,
+       producers.producer,
+       producers.varietal,
+       producers.vineyard,
+       producers.designation,
+       producers.subregion,
+       producers.region,
+       producers.country,
+       producers.category
+from inventory
+left join producers on inventory.pid = producers.pid
+order by producer;
+
+CREATE TABLE IF NOT EXISTS notes(
+  iid INTEGER PRIMARY KEY,
+  note TEXT NOT NULL);
+
+CREATE TABLE IF NOT EXISTS vineyards(
+  region TEXT NOT NULL,
+  village TEXT NOT NULL,
+  vineyard TEXT NOT NULL,
+  umbrella_vin TEXT DEFAULT NULL,
+  designation TEXT DEFAULT NULL,
+  note TEXT DEFAULT NULL);
+#+end_src
