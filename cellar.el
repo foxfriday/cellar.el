@@ -1,7 +1,7 @@
 ;;; cellar.el --- Manage the cellar with Emacs and sqlite. -*- lexical-binding: t; -*-
 
 ;; Version: 0.0.01
-;; URL: https://github.com/foxfriday/cellar
+;; URL: https://github.com/foxfriday/cellar.el
 ;; Package-Requires: ((emacs "29"))
 
 ;;; Commentary:
@@ -12,11 +12,14 @@
 
 (require 'cl-lib)
 
-(defvar cellar-database "~/Repos/notes/cellar/data/inventory.db"
+(defvar cellar-database "~/Repos/notes/data/inventory.db"
   "The location of the database.")
 
 (defvar cellar-note-txt "** %s\n:PROPERTIES:\n:IID: %s\n:DT: %s\n:SCORE:\n:END:\n"
   "Text used for notes using name, id, and date.")
+
+(defvar cellar-note-file "~/Repos/notes/src/wine/wine-notes.org"
+  "File with the notes.")
 
 (defun cellar--open (db)
   "Open the database DB."
@@ -177,6 +180,10 @@
          (btl (cellar--select-iid wdb))
          (txt cellar-note-txt))
     (when btl
+      (unless (file-exists-p cellar-note-file)
+        (error "Cellar not file does not exist"))
+      (switch-to-buffer (find-file-noselect cellar-note-file))
+      (goto-char (point-max))
       (insert (format txt
                       (car (cdr btl))
                       (car btl)
