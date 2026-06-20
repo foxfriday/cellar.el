@@ -1,6 +1,6 @@
 ;;; cellar.el --- Manage the cellar with Emacs and sqlite. -*- lexical-binding: t; -*-
 
-;; Version: 0.1.0
+;; Version: 0.1.1
 ;; URL: https://github.com/foxfriday/cellar.el
 ;; Package-Requires: ((emacs "29"))
 
@@ -21,12 +21,12 @@
   :group 'applications
   :prefix "cellar-")
 
-(defcustom cellar-database "~/Repos/wine/inventory/inventory.db"
+(defcustom cellar-database "~/Repos/wiki/db/inventory.db"
   "The location of the database."
   :type 'file
   :group 'cellar)
 
-(defcustom cellar-note-dir "~/Repos/wine/notes/"
+(defcustom cellar-note-dir "~/Repos/wiki/docs/cellar/"
   "Directory for tasting note files."
   :type 'directory
   :group 'cellar)
@@ -49,55 +49,39 @@
 
 ;;; Tasting Note Helpers
 
-(defun cellar--ensure-tastings-table (db)
-  "Create the tastings table in DB if it does not exist."
-  (sqlite-execute
-   db
-   "CREATE TABLE IF NOT EXISTS tastings(
-      tid        INTEGER PRIMARY KEY AUTOINCREMENT,
-      iid        INTEGER NOT NULL,
-      date       TEXT NOT NULL,
-      appearance INTEGER,
-      aroma      INTEGER,
-      taste      INTEGER,
-      aftertaste INTEGER,
-      impression INTEGER,
-      score      INTEGER GENERATED ALWAYS AS
-                   (appearance+aroma+taste+aftertaste+impression) STORED,
-      filename   TEXT NOT NULL UNIQUE,
-      FOREIGN KEY (iid) REFERENCES inventory(iid) ON DELETE RESTRICT)"))
-
 (defun cellar--parse-note ()
   "Parse a tasting note buffer and return a plist of its data.
-Returns a plist with :iid, :date, :appearance, :aroma, :taste,
-:aftertaste, :impression, or nil if iid or date cannot be parsed."
+Reads `iid', `date', and the five score keys from the YAML
+frontmatter only.  Returns a plist with :iid, :date, :appearance,
+:aroma, :taste, :aftertaste, :impression, or nil if iid or date
+cannot be parsed."
   (save-excursion
-    (goto-char (point-min))
-    (let (iid date appearance aroma taste aftertaste impression)
-      (when (re-search-forward "^iid: \\([0-9]+\\)" nil t)
-        (setq iid (string-to-number (match-string 1))))
+    (save-restriction
       (goto-char (point-min))
-      (when (re-search-forward "^date: \\([0-9-]+\\)" nil t)
-        (setq date (match-string 1)))
-      (goto-char (point-min))
-      (when (re-search-forward "^## Appearance (\\([0-9]+\\)/[0-9]+)" nil t)
-        (setq appearance (string-to-number (match-string 1))))
-      (goto-char (point-min))
-      (when (re-search-forward "^## Aroma (\\([0-9]+\\)/[0-9]+)" nil t)
-        (setq aroma (string-to-number (match-string 1))))
-      (goto-char (point-min))
-      (when (re-search-forward "^## Taste (\\([0-9]+\\)/[0-9]+)" nil t)
-        (setq taste (string-to-number (match-string 1))))
-      (goto-char (point-min))
-      (when (re-search-forward "^## Aftertaste (\\([0-9]+\\)/[0-9]+)" nil t)
-        (setq aftertaste (string-to-number (match-string 1))))
-      (goto-char (point-min))
-      (when (re-search-forward "^## Impression (\\([0-9]+\\)/[0-9]+)" nil t)
-        (setq impression (string-to-number (match-string 1))))
-      (when (and iid date)
-        (list :iid iid :date date
-              :appearance appearance :aroma aroma :taste taste
-              :aftertaste aftertaste :impression impression)))))
+      ;; Narrow to the YAML frontmatter so free-form prose in the body
+      ;; cannot accidentally match a `key: value' line.
+      (when (looking-at "^---[ \t]*\n")
+        (let ((start (match-end 0)))
+          (goto-char start)
+          (when (re-search-forward "^---[ \t]*$" nil t)
+            (narrow-to-region start (match-beginning 0)))))
+      (cl-flet ((field (key pattern)
+                  (goto-char (point-min))
+                  (when (re-search-forward
+                         (format "^%s: *%s" key pattern) nil t)
+                    (match-string 1))))
+        (let ((iid (field "iid" "\\([0-9]+\\)"))
+              (date (field "date" "\\([0-9-]+\\)")))
+          (when (and iid date)
+            (cl-flet ((score (key)
+                        (let ((v (field key "\\([0-9]+\\)")))
+                          (and v (string-to-number v)))))
+              (list :iid (string-to-number iid) :date date
+                    :appearance (score "appearance")
+                    :aroma (score "aroma")
+                    :taste (score "taste")
+                    :aftertaste (score "aftertaste")
+                    :impression (score "impression")))))))))
 
 (defun cellar--upsert-tasting (db data filename)
   "Upsert tasting DATA with FILENAME into the tastings table in DB."
@@ -128,16 +112,15 @@ Returns a plist with :iid, :date, :appearance, :aroma, :taste,
     (unless data
       (error "Could not parse iid or date from note"))
     (cellar--with-db db
-      (cellar--ensure-tastings-table db)
       (cellar--upsert-tasting db data filename))
     (message "Synced %s" filename)))
 
 ;;; Selection Helpers
 
-(defun cellar--select-pid (db)
-  "Select a producer id from the database DB."
-  (let* ((cols "producer,region,subregion,vineyard,designation,varietal,category")
-         (countries (sqlite-select
+(defun cellar--read-producer (db)
+  "Prompt for country, region, and producer in DB.
+Return a cons cell of (PRODUCER . REGION)."
+  (let* ((countries (sqlite-select
                      db
                      "SELECT DISTINCT country FROM producers
                       ORDER BY country"))
@@ -153,63 +136,53 @@ Returns a plist with :iid, :date, :appearance, :aroma, :taste,
                      "SELECT DISTINCT producer FROM producers
                       WHERE country = ? AND region = ? ORDER BY producer"
                      (list country region)))
-         (producer (completing-read "Producer: " producers))
-         (wines (sqlite-select
-                 db
-                 (concat "SELECT pid, concat_ws(' ',"
-                         cols
-                         ") FROM producers "
-                         "WHERE producer = ? AND region = ? "
-                         "ORDER BY subregion, vineyard")
-                 (list producer region)))
-         (choices (make-hash-table :size (safe-length wines) :test 'equal)))
-    (dolist (row wines)
+         (producer (completing-read "Producer: " producers)))
+    (cons producer region)))
+
+(defun cellar--select-from-rows (rows prompt)
+  "Select an id from ROWS using PROMPT.
+Each row is a list of (ID LABEL); return the ID for the chosen LABEL."
+  (let ((choices (make-hash-table :size (safe-length rows) :test 'equal)))
+    (dolist (row rows)
       (puthash (format "%s" (cadr row)) (car row) choices))
-    (gethash (completing-read "Bottle: " choices) choices nil)))
+    (gethash (completing-read prompt choices) choices nil)))
+
+(defun cellar--select-pid (db)
+  "Select a producer id from the database DB."
+  (let* ((pr (cellar--read-producer db))
+         (rows (sqlite-select
+                db
+                "SELECT pid, concat_ws(' ',producer,region,subregion,
+                                       vineyard,designation,varietal,category)
+                 FROM producers WHERE producer = ? AND region = ?
+                 ORDER BY subregion, vineyard"
+                (list (car pr) (cdr pr)))))
+    (cellar--select-from-rows rows "Bottle: ")))
 
 (defun cellar--select-iid (db)
   "Select an inventory id from the database DB."
-  (let* ((cols "vint,producer,subregion,vineyard,designation,varietal,category,btl")
-         (countries (sqlite-select
-                     db
-                     "SELECT DISTINCT country FROM producers
-                      ORDER BY country"))
-         (country (completing-read "Country: " countries))
-         (regions (sqlite-select
-                   db
-                   "SELECT DISTINCT region FROM producers
-                    WHERE country = ? ORDER BY region"
-                   (list country)))
-         (region (completing-read "Region: " regions))
-         (producers (sqlite-select
-                     db
-                     "SELECT DISTINCT producer FROM producers
-                      WHERE country = ? AND region = ? ORDER BY producer"
-                     (list country region)))
-         (producer (completing-read "Producer: " producers))
-         (wines (sqlite-select
-                 db
-                 (concat "SELECT iid, concat_ws(' ',"
-                         cols
-                         ") FROM wines "
-                         "WHERE producer = ? AND region = ? "
-                         "ORDER BY vint, subregion")
-                 (list producer region)))
-         (choices (make-hash-table :size (safe-length wines) :test 'equal)))
-    (dolist (row wines)
-      (puthash (format "%s" (cadr row)) (car row) choices))
-    (gethash (completing-read "Bottle: " choices) choices nil)))
+  (let* ((pr (cellar--read-producer db))
+         (rows (sqlite-select
+                db
+                "SELECT iid, concat_ws(' ',vint,producer,subregion,vineyard,
+                                       designation,varietal,category,btl)
+                 FROM wines WHERE producer = ? AND region = ?
+                 ORDER BY vint, subregion"
+                (list (car pr) (cdr pr)))))
+    (cellar--select-from-rows rows "Bottle: ")))
 
-(cl-defun cellar--check-inventory (&key id db offsite insite)
-  "Check OFFSITE and INSITE inventory for wine ID in database DB."
-  (let ((omin (or offsite 0))
-        (hmin (or insite 0))
+(cl-defun cellar--check-inventory (&key id db offsite-min home-min)
+  "Return non-nil if wine ID in DB has enough bottles in stock.
+Requires at least OFFSITE-MIN bottles offsite (oi) and HOME-MIN
+bottles at home (hi).  Returns nil when ID does not exist."
+  (let ((offsite-min (or offsite-min 0))
+        (home-min (or home-min 0))
         (winv (car (sqlite-select
                     db
                     "SELECT oi, hi FROM inventory WHERE iid = ?"
                     (list id)))))
     (when winv
-      (and (>= (car winv) omin) (>= (cadr winv) hmin)))))
+      (and (>= (car winv) offsite-min) (>= (cadr winv) home-min)))))
 
 (defun cellar--check-prefix (prefix)
   "Return the number from the PREFIX."
@@ -230,14 +203,29 @@ Returns a plist with :iid, :date, :appearance, :aroma, :taste,
                                  (sqlite-select db sql))))
       (if (or (string= ret "") (string= ret "null")) nil ret))))
 
+(defun cellar--read-validated (given prompt label min max)
+  "Return a validated number for an optional database field.
+Use GIVEN when non-nil, otherwise read a number with PROMPT.  A
+value of 0 (or empty input) means \"unset\" and returns nil.
+Signal an error built from LABEL when the value is below MIN or
+above MAX."
+  (let ((n (or given (string-to-number (read-from-minibuffer prompt)))))
+    (cond ((= n 0) nil)
+          ((or (< n min) (> n max))
+           (error "%s of %s is invalid" label n))
+          (t n))))
+
 ;;; Core Operations
 
 (cl-defun cellar--move (&key offsite insite consume iid)
   "Add OFFSITE, move INSITE from offsite and CONSUME from home.
 If IID is nil, prompt user to select a wine."
   (cellar--with-db wdb
+    ;; Moving INSITE bottles onsite needs that many offsite (oi); consuming
+    ;; CONSUME bottles needs that many at home (hi).
     (let* ((iid (or iid (cellar--select-iid wdb)))
-           (iok (cellar--check-inventory :id iid :db wdb :insite consume :offsite insite)))
+           (iok (cellar--check-inventory :id iid :db wdb
+                                         :offsite-min insite :home-min consume)))
       (unless iok
         (error "Not enough inventory"))
       (when offsite
@@ -306,7 +294,8 @@ If IID is nil, prompt user to select a wine."
     (when (file-exists-p filepath)
       (error "Note file %s already exists" filepath))
     (cellar--with-db wdb
-      (let* ((iid (cellar--select-iid wdb))
+      (let* ((iid (or (cellar--select-iid wdb)
+                      (user-error "No wine selected")))
              (row (car (sqlite-select
                         wdb
                         "SELECT vint, producer, subregion, vineyard,
@@ -323,27 +312,27 @@ If IID is nil, prompt user to select a wine."
              (btl        (nth 7 row))
              (content
               (concat "---\n"
+                      (format "title: %s %s\n" vint producer)
+                      "keywords: [wine note]\n"
                       (format "iid: %s\n" iid)
-                      (format "vintage: %s\n" vint)
-                      (format "producer: \"%s\"\n" producer)
-                      (when subregion
-                        (format "subregion: \"%s\"\n" subregion))
-                      (when vineyard
-                        (format "vineyard: \"%s\"\n" vineyard))
-                      (when designation
-                        (format "designation: \"%s\"\n" designation))
-                      (format "varietal: \"%s\"\n" varietal)
-                      (when category
-                        (format "category: \"%s\"\n" category))
-                      (format "size: %s\n" btl)
                       (format "date: %s\n" (format-time-string "%Y-%m-%d"))
-                      "score:\n"
-                      "---\n"
-                      "\n## Appearance (0/3)\n"
-                      "\n## Aroma (0/5)\n"
-                      "\n## Taste (0/5)\n"
-                      "\n## Aftertaste (0/3)\n"
-                      "\n## Impression (0/4)\n")))
+                      "appearance: 0  # /3\n"
+                      "aroma: 0       # /5\n"
+                      "taste: 0       # /5\n"
+                      "aftertaste: 0  # /3\n"
+                      "impression: 0  # /4\n"
+                      "---\n\n"
+                      (when subregion
+                        (format "- Subregion: %s\n" subregion))
+                      (when vineyard
+                        (format "- Vineyard: %s\n" vineyard))
+                      (when designation
+                        (format "- Designation: %s\n" designation))
+                      (format "- Varietal: %s\n" varietal)
+                      (when category
+                        (format "- Category: %s\n" category))
+                      (format "- Size: %s ml\n" btl)
+                      "\n## Notes\n\n")))
         (find-file filepath)
         (insert content)
         (goto-char (point-min))))))
@@ -399,36 +388,15 @@ Values are VINT, BTL, OI, ALC, W0, and W1."
                 (completing-read
                  "Quantity: "
                  (list "6" "12" "1" "2" "3" "4" "5" "7" "8" "9" "10" "11")))))
-         (alc (if alc
-                   alc
-                (string-to-number (read-from-minibuffer "Alcohol (e.g. 13.5): "))))
-         (w0 (if w0
-                  w0
-               (string-to-number (read-from-minibuffer "Window Start: "))))
-         (w1 (if w1
-                  w1
-               (string-to-number (read-from-minibuffer "Window End: ")))))
+         (alc (cellar--read-validated alc "Alcohol (e.g. 13.5): " "Alcohol" 0.0 100.0))
+         (w0 (cellar--read-validated w0 "Window Start: " "Window start" 2000 2100))
+         (w1 (cellar--read-validated w1 "Window End: " "Window end" 2000 2100)))
     (when (or (< vint 1900) (> vint 2050))
       (error "The vintage year %s is invalid" vint))
     (when (or (< btl 187) (> btl 3000))
       (error "Bottle size of %s is invalid" btl))
     (when (< oi 1)
       (error "Inventory of %s is invalid" oi))
-    (setq alc (if (= alc 0)
-                  nil
-                (if (or (<= alc 0.0) (> alc 100.0))
-                    (error "Alcohol of %s is invalid" alc)
-                  alc)))
-    (setq w0 (if (= w0 0)
-                 nil
-               (if (or (< w0 2000) (> w0 2100))
-                   (error "Window start of %s is invalid" w0)
-                 w0)))
-    (setq w1 (if (= w1 0)
-                 nil
-               (if (or (< w1 2000) (> w1 2100))
-                   (error "Window end of %s is invalid" w1)
-                 w1)))
     (cellar--with-db wdb
       (let ((pid (cellar--select-pid wdb)))
         (message "%s database updates"
@@ -439,22 +407,8 @@ Values are VINT, BTL, OI, ALC, W0, and W1."
   "Update window (W0 to W1) for wine with id IID."
   (interactive)
   (let* ((sql "UPDATE inventory SET w0=?, w1=? WHERE iid=?")
-         (w0 (if w0
-                  w0
-               (string-to-number (read-from-minibuffer "Window Start: "))))
-         (w1 (if w1
-                  w1
-               (string-to-number (read-from-minibuffer "Window End: ")))))
-    (setq w0 (if (= w0 0)
-                 nil
-               (if (or (< w0 2000) (> w0 2100))
-                   (error "Window start of %s is invalid" w0)
-                 w0)))
-    (setq w1 (if (= w1 0)
-                 nil
-               (if (or (< w1 2000) (> w1 2100))
-                   (error "Window end of %s is invalid" w1)
-                 w1)))
+         (w0 (cellar--read-validated w0 "Window Start: " "Window start" 2000 2100))
+         (w1 (cellar--read-validated w1 "Window End: " "Window end" 2000 2100)))
     (cellar--with-db wdb
       (let ((iid (or iid (cellar--select-iid wdb))))
         (message "%s database updates"
@@ -465,21 +419,14 @@ Values are VINT, BTL, OI, ALC, W0, and W1."
   "Update alcohol to ALC for wine with id IID."
   (interactive)
   (let* ((sql "UPDATE inventory SET alc=? WHERE iid=?")
-         (alc (if alc
-                   alc
-                (string-to-number (read-from-minibuffer "Alcohol (e.g. 13.5): ")))))
-    (setq alc (if (= alc 0)
-                  nil
-                (if (or (<= alc 0.0) (> alc 100.0))
-                    (error "Alcohol of %s is invalid" alc)
-                  alc)))
+         (alc (cellar--read-validated alc "Alcohol (e.g. 13.5): " "Alcohol" 0.0 100.0)))
     (cellar--with-db wdb
       (let ((iid (or iid (cellar--select-iid wdb))))
         (message "%s database updates"
                  (sqlite-execute wdb sql (list alc iid)))))))
 
 ;;;###autoload
-(cl-defun cellar-add-note (&key note iid)
+(cl-defun cellar-add-bottle-annotation (&key note iid)
   "Add NOTE to bottle with id IID."
   (interactive)
   (let ((note (if note
@@ -503,7 +450,6 @@ upserts into the database.  Reports the number of notes synced."
   (let ((files (directory-files cellar-note-dir t "\\.md\\'"))
         (count 0))
     (cellar--with-db db
-      (cellar--ensure-tastings-table db)
       (dolist (f files)
         (with-temp-buffer
           (insert-file-contents f)
@@ -519,13 +465,21 @@ upserts into the database.  Reports the number of notes synced."
 (defvar-local cellar-list--filter nil
   "Current filter as (COLUMN . VALUE) or nil.")
 
+(defun cellar-list--update-mode-line ()
+  "Reflect the active filter (if any) in the mode line."
+  (setq mode-line-process
+        (when cellar-list--filter
+          (format " [%s=%s]" (car cellar-list--filter)
+                  (cdr cellar-list--filter))))
+  (force-mode-line-update))
+
 (defun cellar-list--entries ()
   "Fetch wine entries from database for tabulated list."
   (cellar--with-db db
     (let* ((where (when cellar-list--filter
                     (format " WHERE %s = ?" (car cellar-list--filter))))
-           (sql (concat "SELECT iid, vint, producer, region, varietal, "
-                        "designation, btl, oi, hi, tot, alc, w0, w1 "
+           (sql (concat "SELECT iid, producer, region, subregion, vineyard, "
+                        "varietal, designation, vint, tot, w0, w1 "
                         "FROM wines"
                         where
                         " ORDER BY producer, vint"))
@@ -535,23 +489,20 @@ upserts into the database.  Reports the number of notes synced."
       (mapcar (lambda (row)
                 (list (nth 0 row)
                       (vector
-                       (format "%s" (or (nth 1 row) ""))
+                       (format "%s" (nth 0 row))
+                       (or (nth 1 row) "")
                        (or (nth 2 row) "")
                        (or (nth 3 row) "")
                        (or (nth 4 row) "")
                        (or (nth 5 row) "")
-                       (format "%s" (or (nth 6 row) ""))
+                       (or (nth 6 row) "")
                        (format "%s" (or (nth 7 row) ""))
                        (format "%s" (or (nth 8 row) ""))
-                       (format "%s" (or (nth 9 row) ""))
-                       (if (nth 10 row)
-                           (format "%.1f" (nth 10 row))
-                         "")
                        (cond
-                        ((and (nth 11 row) (nth 12 row))
-                         (format "%s-%s" (nth 11 row) (nth 12 row)))
-                        ((nth 11 row)
-                         (format "%s-" (nth 11 row)))
+                        ((and (nth 9 row) (nth 10 row))
+                         (format "%s-%s" (nth 9 row) (nth 10 row)))
+                        ((nth 9 row)
+                         (format "%s-" (nth 9 row)))
                         (t "")))))
               rows))))
 
@@ -562,7 +513,7 @@ upserts into the database.  Reports the number of notes synced."
     (define-key map "a" #'cellar-list-add-offsite)
     (define-key map "w" #'cellar-list-update-window)
     (define-key map "A" #'cellar-list-update-alcohol)
-    (define-key map "n" #'cellar-list-add-note)
+    (define-key map "n" #'cellar-list-add-bottle-annotation)
     (define-key map "N" #'cellar-note)
     (define-key map "d" #'cellar-list-delete-bottle)
     (define-key map (kbd "RET") #'cellar-list-detail)
@@ -571,21 +522,25 @@ upserts into the database.  Reports the number of notes synced."
     map))
 
 (define-derived-mode cellar-list-mode tabulated-list-mode "Cellar"
-  "Major mode for browsing wine cellar inventory."
+  "Major mode for browsing wine cellar inventory.
+
+\\{cellar-list-mode-map}"
   (setq tabulated-list-format
-        [("Vint" 5 t)
-         ("Producer" 20 t)
+        [("iid" 5 t :right-align t)
+         ("Producer" 25 t)
          ("Region" 15 t)
+         ("Subregion" 15 t)
+         ("Vineyard" 20 t)
          ("Varietal" 15 t)
          ("Designation" 12 t)
-         ("Btl" 5 t :right-align t)
-         ("Off" 4 t :right-align t)
-         ("Home" 5 t :right-align t)
+         ("Vint" 5 t)
          ("Tot" 4 t :right-align t)
-         ("Alc" 5 t :right-align t)
          ("Window" 10 t)])
   (setq tabulated-list-entries #'cellar-list--entries)
-  (tabulated-list-init-header))
+  (setq tabulated-list-sort-key (cons "Producer" nil))
+  (tabulated-list-init-header)
+  (cellar-list--update-mode-line)
+  (hl-line-mode 1))
 
 ;;;###autoload
 (defun cellar-browse ()
@@ -597,14 +552,29 @@ upserts into the database.  Reports the number of notes synced."
       (tabulated-list-print t))
     (switch-to-buffer buf)))
 
+(defun cellar-list--label (iid)
+  "Return a human-readable \"VINT PRODUCER\" label for the row at point.
+Falls back to IID when no entry is available."
+  (let ((entry (tabulated-list-get-entry)))
+    (if entry
+        (let ((vint (aref entry 7))
+              (producer (aref entry 1)))
+          (format "%s %s (id %s)"
+                  (if (string= vint "") "NV" vint)
+                  producer iid))
+      (format "id %s" iid))))
+
 (defun cellar-list-consume (number)
   "Consume NUMBER bottles of wine at point."
   (interactive "P")
   (let ((iid (tabulated-list-get-id))
         (n (cellar--check-prefix number)))
     (unless iid (user-error "No wine at point"))
-    (cellar--move :consume n :iid iid)
-    (tabulated-list-revert)))
+    (when (< n 1) (user-error "Number of bottles must be at least 1"))
+    (when (yes-or-no-p
+           (format "Consume %d bottle(s) of %s? " n (cellar-list--label iid)))
+      (cellar--move :consume n :iid iid)
+      (tabulated-list-revert))))
 
 (defun cellar-list-move-onsite (number)
   "Move NUMBER bottles from offsite to home for wine at point."
@@ -612,8 +582,11 @@ upserts into the database.  Reports the number of notes synced."
   (let ((iid (tabulated-list-get-id))
         (n (cellar--check-prefix number)))
     (unless iid (user-error "No wine at point"))
-    (cellar--move :insite n :iid iid)
-    (tabulated-list-revert)))
+    (when (< n 1) (user-error "Number of bottles must be at least 1"))
+    (when (yes-or-no-p
+           (format "Move %d bottle(s) onsite for %s? " n (cellar-list--label iid)))
+      (cellar--move :insite n :iid iid)
+      (tabulated-list-revert))))
 
 (defun cellar-list-add-offsite (number)
   "Add NUMBER bottles to offsite for wine at point."
@@ -621,8 +594,11 @@ upserts into the database.  Reports the number of notes synced."
   (let ((iid (tabulated-list-get-id))
         (n (cellar--check-prefix number)))
     (unless iid (user-error "No wine at point"))
-    (cellar--move :offsite n :iid iid)
-    (tabulated-list-revert)))
+    (when (< n 1) (user-error "Number of bottles must be at least 1"))
+    (when (yes-or-no-p
+           (format "Add %d bottle(s) offsite for %s? " n (cellar-list--label iid)))
+      (cellar--move :offsite n :iid iid)
+      (tabulated-list-revert))))
 
 (defun cellar-list-update-window ()
   "Update drinking window for wine at point."
@@ -640,12 +616,12 @@ upserts into the database.  Reports the number of notes synced."
     (cellar-update-alcohol :iid iid)
     (tabulated-list-revert)))
 
-(defun cellar-list-add-note ()
+(defun cellar-list-add-bottle-annotation ()
   "Add a database note for wine at point."
   (interactive)
   (let ((iid (tabulated-list-get-id)))
     (unless iid (user-error "No wine at point"))
-    (cellar-add-note :iid iid)
+    (cellar-add-bottle-annotation :iid iid)
     (tabulated-list-revert)))
 
 (defun cellar-list-delete-bottle ()
@@ -653,7 +629,7 @@ upserts into the database.  Reports the number of notes synced."
   (interactive)
   (let ((iid (tabulated-list-get-id)))
     (unless iid (user-error "No wine at point"))
-    (when (yes-or-no-p (format "Delete inventory entry %s? " iid))
+    (when (yes-or-no-p (format "Delete %s? " (cellar-list--label iid)))
       (cellar--with-db db
         (sqlite-execute db "DELETE FROM inventory WHERE iid = ?" (list iid)))
       (tabulated-list-revert))))
@@ -728,12 +704,14 @@ upserts into the database.  Reports the number of notes synced."
                                field field)))
              (value (completing-read (format "%s: " (capitalize field)) values)))
         (setq cellar-list--filter (cons field value)))))
+  (cellar-list--update-mode-line)
   (tabulated-list-revert))
 
 (defun cellar-list-clear-filter ()
   "Clear any active filter."
   (interactive)
   (setq cellar-list--filter nil)
+  (cellar-list--update-mode-line)
   (tabulated-list-revert))
 
 (provide 'cellar)

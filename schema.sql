@@ -5,12 +5,6 @@
 
 PRAGMA foreign_keys = ON;
 
-CREATE TABLE cellar_meta(
-  key TEXT PRIMARY KEY,
-  value TEXT NOT NULL);
-
-INSERT INTO cellar_meta(key, value) VALUES('schema_version', '3');
-
 CREATE TABLE producers(
   pid INTEGER PRIMARY KEY AUTOINCREMENT,
   producer TEXT NOT NULL,
@@ -20,8 +14,8 @@ CREATE TABLE producers(
   subregion TEXT DEFAULT NULL,
   region TEXT NOT NULL,
   country TEXT NOT NULL,
-  category TEXT DEFAULT NULL,
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  Category TEXT DEFAULT NULL,
+  created_at TEXT NOT NULL DEFAUlt (datetime('now')),
   UNIQUE(producer, varietal, vineyard, designation, category));
 
 CREATE TABLE inventory(
